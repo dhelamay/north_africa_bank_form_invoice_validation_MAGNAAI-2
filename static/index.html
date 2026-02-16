@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MagnaAI — L/C Document Processing</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <div>
+                    <h1 data-i18n="appTitle">🏦 MagnaAI — Letter of Credit Processing</h1>
+                    <p class="subtitle" data-i18n="appSubtitle">AI-Powered Document Extraction & Validation</p>
+                </div>
+                <div class="language-toggle">
+                    <button id="langEn" class="lang-btn active">EN</button>
+                    <button id="langAr" class="lang-btn">عربي</button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            <!-- Left Sidebar: Upload & Controls -->
+            <aside class="sidebar">
+                <div class="card">
+                    <h2>① Upload Document</h2>
+                    <div class="upload-area" id="uploadArea">
+                        <input type="file" id="pdfInput" accept=".pdf" hidden>
+                        <div class="upload-prompt">
+                            <svg width="48" height="48" fill="currentColor" viewBox="0 0 16 16">
+                                <path d="M.5 9.9a.5.5 0 0 1 .5.5v2.5a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-2.5a.5.5 0 0 1 1 0v2.5a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2v-2.5a.5.5 0 0 1 .5-.5z"/>
+                                <path d="M7.646 1.146a.5.5 0 0 1 .708 0l3 3a.5.5 0 0 1-.708.708L8.5 2.707V11.5a.5.5 0 0 1-1 0V2.707L5.354 4.854a.5.5 0 1 1-.708-.708l3-3z"/>
+                            </svg>
+                            <p>Click to upload or drag & drop</p>
+                            <small>PDF files only</small>
+                        </div>
+                    </div>
+                    <div id="fileInfo" class="file-info hidden"></div>
+                </div>
+
+                <div class="card" id="extractionControls" style="display: none;">
+                    <h2>② Extract Settings</h2>
+
+                    <label>LLM Provider</label>
+                    <select id="llmProvider">
+                        <option value="gemini">Google Gemini</option>
+                        <option value="openai">OpenAI GPT-4o</option>
+                    </select>
+
+                    <label>Model</label>
+                    <select id="modelSelect">
+                        <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+                        <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
+                        <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
+                    </select>
+
+                    <label>Method</label>
+                    <select id="methodSelect">
+                        <option value="vision">Vision AI (Recommended)</option>
+                        <option value="text">Text Extraction</option>
+                        <option value="ocr">OCR + LLM</option>
+                    </select>
+
+                    <button id="extractBtn" class="btn btn-primary">
+                        🔍 Extract Information
+                    </button>
+                </div>
+
+                <div class="card status-card" id="statusCard" style="display: none;">
+                    <h3>Status</h3>
+                    <div id="statusContent"></div>
+                </div>
+            </aside>
+
+            <!-- Right Panel: Results -->
+            <main class="results-panel">
+                <div id="welcomeScreen" class="welcome-screen">
+                    <h2>Welcome to MagnaAI</h2>
+                    <p>Upload a Letter of Credit PDF to get started.</p>
+                    <ul>
+                        <li>✅ AI-powered field extraction</li>
+                        <li>✅ Multi-language support (EN, AR, ES, IT)</li>
+                        <li>✅ External API verification (SWIFT, Ports, HS Codes)</li>
+                        <li>✅ Cross-document validation</li>
+                    </ul>
+                </div>
+
+                <div id="resultsArea" class="results-area hidden">
+                    <!-- Tabs -->
+                    <div class="tabs">
+                        <button class="tab-btn active" data-tab="extracted">📋 Extracted</button>
+                        <button class="tab-btn" data-tab="validation">✅ Validation</button>
+                        <button class="tab-btn" data-tab="verification">🔎 Verification</button>
+                        <button class="tab-btn" data-tab="chat">💬 Chat</button>
+                        <button class="tab-btn" data-tab="search">🔍 Deep Search</button>
+                        <button class="tab-btn" data-tab="preview">📝 Preview</button>
+                        <button class="tab-btn" data-tab="raw">🔬 Raw</button>
+                    </div>
+
+                    <!-- Tab Content: Extracted Fields -->
+                    <div id="tab-extracted" class="tab-content active">
+                        <div class="extraction-summary" id="extractionSummary"></div>
+                        <div class="fields-grid" id="fieldsGrid"></div>
+                    </div>
+
+                    <!-- Tab Content: Validation -->
+                    <div id="tab-validation" class="tab-content">
+                        <div class="validation-header">
+                            <h3>📋 Document Validation</h3>
+                            <button id="runValidationBtn" class="btn btn-primary" style="width: auto; padding: 0.5rem 1.5rem;">
+                                Run Validation Checks
+                            </button>
+                        </div>
+                        <div id="validationResults" class="validation-results">
+                            <p class="empty-state">Click "Run Validation Checks" to cross-validate the extracted data.</p>
+                        </div>
+                    </div>
+
+                    <!-- Tab Content: Verification -->
+                    <div id="tab-verification" class="tab-content">
+                        <div class="verification-header">
+                            <h3>🔎 API Verification Panel</h3>
+                            <p class="subtitle">Verify fields using external APIs (SWIFT, Ports, HS Codes, Sanctions, etc.)</p>
+                            <button id="verifyAllBtn" class="btn btn-primary" style="width: auto; padding: 0.5rem 1.5rem;">
+                                ⚡ Verify All Fields
+                            </button>
+                        </div>
+                        <div id="verificationResults" class="verification-grid">
+                            <p class="empty-state">Extract a document first, then verify fields here.</p>
+                        </div>
+                    </div>
+
+                    <!-- Tab Content: Chat -->
+                    <div id="tab-chat" class="tab-content">
+                        <div class="chat-container">
+                            <div class="chat-messages" id="chatMessages">
+                                <div class="chat-welcome">
+                                    <h3>💬 Chat Assistant</h3>
+                                    <p>Ask questions about the extracted Letter of Credit document.</p>
+                                    <div class="chat-examples">
+                                        <p><strong>Try asking:</strong></p>
+                                        <ul>
+                                            <li>"What is the total amount?"</li>
+                                            <li>"When does this L/C expire?"</li>
+                                            <li>"Who is the beneficiary?"</li>
+                                            <li>"Summarize the key terms"</li>
+                                        </ul>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="chat-input-container">
+                                <input type="text" id="chatInput" placeholder="Ask a question about the document..." />
+                                <button id="chatSendBtn" class="btn btn-primary">Send</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Tab Content: Deep Search -->
+                    <div id="tab-search" class="tab-content">
+                        <div class="search-container">
+                            <h3>🔍 Deep Research</h3>
+                            <p class="subtitle">Search the uploaded document + external sources (Perplexity + Exa)</p>
+
+                            <div class="search-input-group">
+                                <input type="text" id="searchQuery" placeholder="Enter your research query (e.g., 'Verify HSBC Bank SWIFT code')" />
+                                <button id="searchBtn" class="btn btn-primary">Research</button>
+                            </div>
+
+                            <div class="search-options">
+                                <label>
+                                    <input type="checkbox" id="searchDocumentCheck" checked />
+                                    Search uploaded document
+                                </label>
+                                <label>
+                                    <input type="checkbox" id="searchExternalCheck" checked />
+                                    Search external sources (Perplexity + Exa)
+                                </label>
+                            </div>
+
+                            <div id="searchResults" class="search-results">
+                                <p class="empty-state">Enter a query and click "Research" to start deep search.</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Tab Content: PDF Preview -->
+                    <div id="tab-preview" class="tab-content">
+                        <div class="pdf-preview">
+                            <div id="pdfMetadata" class="pdf-metadata"></div>
+                            <textarea id="pdfTextPreview" readonly placeholder="PDF text will appear here after extraction..."></textarea>
+                        </div>
+                    </div>
+
+                    <!-- Tab Content: Raw Response -->
+                    <div id="tab-raw" class="tab-content">
+                        <pre id="rawResponse"></pre>
+                    </div>
+                </div>
+            </main>
+        </div>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>
+                MagnaAI v2.0 — Powered by FastMCP + LangGraph + FastAPI
+                <span class="separator">•</span>
+                <a href="/docs" target="_blank">API Docs</a>
+                <span class="separator">•</span>
+                <a href="http://localhost:8501" target="_blank">Streamlit UI</a>
+            </p>
+        </footer>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loadingOverlay" class="loading-overlay hidden">
+        <div class="spinner"></div>
+        <p id="loadingText">Processing...</p>
+    </div>
+
+    <script src="/static/js/i18n.js"></script>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

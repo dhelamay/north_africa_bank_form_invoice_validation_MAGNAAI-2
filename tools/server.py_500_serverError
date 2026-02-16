@@ -1,0 +1,410 @@
+"""
+FastMCP Tool Server — ALL tools registered here as @mcp.tool() functions.
+
+This is the ONLY place tools are defined. Each tool is a plain function
+that calls business logic from utils/. No agent classes, no registries.
+
+Run standalone:  python -m tools.server
+Run in-process:  from tools.server import mcp, call_tool
+"""
+from __future__ import annotations
+import asyncio
+import base64
+import json
+import logging
+import time
+import re
+from typing import Any
+
+from fastmcp import FastMCP
+
+logger = logging.getLogger(__name__)
+
+mcp = FastMCP(
+    "magna-ai-lc-platform",
+    instructions="MagnaAI L/C Document Processing — extraction, validation, verification tools.",
+    version="2.0.0",
+)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  EXTRACTION TOOL
+# ═══════════════════════════════════════════════════════════════
+
+@mcp.tool(tags={"extraction"})
+def extract_lc_document(
+    pdf_bytes_b64: str,
+    method: str = "vision",
+    llm_provider: str = "gemini",
+    model_name: str = "gemini-2.5-flash",
+    language: str = "en",
+) -> dict:
+    """Extract all L/C fields from a PDF into structured JSON."""
+    from schemas.lc_fields import build_extraction_json_keys, build_field_hints
+    from utils.llm_clients import (
+        call_gemini, call_openai, call_gemini_vision, call_openai_vision, parse_json_response,
+    )
+    from utils.pdf_utils import extract_text_pypdf2, extract_text_ocr, pdf_to_base64_images, is_scanned_pdf
+    from config.settings import MAX_PDF_TEXT_FOR_LLM, MAX_VISION_PAGES
+
+    start = time.perf_counter()
+    pdf_bytes = base64.b64decode(pdf_bytes_b64)
+
+    # Auto-detect scanned → vision
+    if method == "text" and is_scanned_pdf(pdf_bytes):
+        method = "vision"
+
+    # Build prompt
+    field_hints = build_field_hints(language)
+    json_keys = json.dumps(build_extraction_json_keys(), indent=2)
+    base_prompt = f"""You are an expert trade-finance and Letter of Credit (L/C) document analyst.
+You can read documents in English, Arabic, Spanish, and Italian.
+
+TASK: Extract ALL information from the document into the JSON structure below.
+
+FIELD REFERENCE (key → English label / Arabic label):
+{field_hints}
+
+RULES:
+1. Read the ENTIRE document — every line, header, footer, stamp, annotation.
+2. Extract EVERY value. NEVER return null if data exists ANYWHERE.
+3. Convert ALL dates to DD/MM/YYYY.
+4. For amounts, include currency code + number (e.g., "USD 150,000.00").
+5. If a field truly cannot be found, use null.
+
+Return ONLY a raw JSON object — no markdown fences:
+{json_keys}"""
+
+    try:
+        if method == "vision":
+            prompt = base_prompt + "\n\nDocument pages provided as images. Read every page. ONLY JSON."
+            if llm_provider == "gemini":
+                raw = call_gemini_vision(pdf_bytes, prompt, model_name=model_name)
+            else:
+                images = pdf_to_base64_images(pdf_bytes, max_pages=MAX_VISION_PAGES)
+                raw = call_openai_vision(images, prompt, model_name=model_name)
+        elif method == "ocr":
+            text = extract_text_ocr(pdf_bytes)
+            prompt = base_prompt + f"\n\nDOCUMENT TEXT (OCR):\n===\n{text[:MAX_PDF_TEXT_FOR_LLM]}\n===\nJSON:"
+            raw = call_gemini(prompt, model_name) if llm_provider == "gemini" else call_openai(prompt, model_name)
+        else:
+            text = extract_text_pypdf2(pdf_bytes)
+            prompt = base_prompt + f"\n\nDOCUMENT TEXT:\n===\n{text[:MAX_PDF_TEXT_FOR_LLM]}\n===\nJSON:"
+            raw = call_gemini(prompt, model_name) if llm_provider == "gemini" else call_openai(prompt, model_name)
+
+        if not raw:
+            return {"success": False, "error": "LLM returned empty response"}
+
+        parsed = parse_json_response(raw)
+        found = sum(1 for v in parsed.values() if v is not None)
+        elapsed = int((time.perf_counter() - start) * 1000)
+
+        return {
+            "success": True, "extracted_data": parsed, "raw_llm_response": raw,
+            "fields_found": found, "fields_total": len(parsed),
+            "method_used": method, "processing_time_ms": elapsed,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  VALIDATION TOOL
+# ═══════════════════════════════════════════════════════════════
+
+@mcp.tool(tags={"validation"})
+def validate_documents(documents: dict, language: str = "en") -> dict:
+    """Cross-validate multiple extracted documents for consistency."""
+    from datetime import datetime
+
+    def _parse_date(val):
+        if not val or not isinstance(val, str): return None
+        for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d"):
+            try: return datetime.strptime(val.strip(), fmt)
+            except: continue
+        return None
+
+    def _parse_amount(val):
+        if not val or not isinstance(val, str): return None
+        cleaned = re.sub(r"[^\d.]", "", val.replace(",", ""))
+        try: return float(cleaned)
+        except: return None
+
+    start = time.perf_counter()
+    checks = []
+    lc = documents.get("letter_of_credit") or documents.get("lc") or {}
+
+    # DATE checks
+    issue = _parse_date(lc.get("date") or lc.get("lc_issue_date"))
+    expiry = _parse_date(lc.get("expiry_date") or lc.get("lc_expiry_date"))
+    shipment = _parse_date(lc.get("latest_shipment_date"))
+
+    if issue and expiry:
+        checks.append({"rule_id": "DATE_001", "rule_name": "Expiry after issue date",
+            "severity": "error", "passed": expiry > issue,
+            "message": f"Expiry {expiry:%d/%m/%Y} {'>' if expiry > issue else '<='} issue {issue:%d/%m/%Y}",
+            "field_keys": ["date", "expiry_date"]})
+    if shipment and expiry:
+        checks.append({"rule_id": "DATE_002", "rule_name": "Shipment before expiry",
+            "severity": "error", "passed": shipment <= expiry,
+            "message": f"Shipment {shipment:%d/%m/%Y} vs expiry {expiry:%d/%m/%Y}",
+            "field_keys": ["latest_shipment_date", "expiry_date"]})
+
+    # AMOUNT checks
+    lc_amount = _parse_amount(lc.get("amount_in_figures"))
+    if lc_amount:
+        for doc_name, doc_data in documents.items():
+            if "invoice" in doc_name.lower():
+                inv_amt = _parse_amount(doc_data.get("amount_in_figures") or doc_data.get("invoice_amount"))
+                if inv_amt:
+                    tol = float(lc.get("percentage_tolerance") or 0) / 100
+                    max_ok = lc_amount * (1 + tol)
+                    checks.append({"rule_id": "AMT_001", "rule_name": f"Invoice amount ({doc_name})",
+                        "severity": "error", "passed": inv_amt <= max_ok,
+                        "message": f"Invoice {inv_amt:.2f} vs L/C max {max_ok:.2f}",
+                        "field_keys": ["amount_in_figures"], "document_types": [doc_name, "letter_of_credit"]})
+
+    # PARTY checks
+    lc_ben = (lc.get("beneficiary_name") or "").strip().lower()
+    for doc_name, doc_data in documents.items():
+        if doc_name == "letter_of_credit": continue
+        doc_ben = (doc_data.get("beneficiary_name") or doc_data.get("beneficiary") or "").strip().lower()
+        if lc_ben and doc_ben:
+            match = lc_ben in doc_ben or doc_ben in lc_ben
+            checks.append({"rule_id": "PARTY_001", "rule_name": f"Beneficiary consistency ({doc_name})",
+                "severity": "warning", "passed": match,
+                "message": f"L/C: '{lc_ben[:50]}' vs {doc_name}: '{doc_ben[:50]}'",
+                "field_keys": ["beneficiary_name"]})
+
+    # PORT checks
+    lc_port = (lc.get("port_loading") or "").strip().lower()
+    for doc_name, doc_data in documents.items():
+        if doc_name == "letter_of_credit": continue
+        doc_port = (doc_data.get("port_loading") or doc_data.get("port_of_loading") or "").strip().lower()
+        if lc_port and doc_port:
+            match = lc_port in doc_port or doc_port in lc_port
+            checks.append({"rule_id": "SHIP_001", "rule_name": f"Port of loading ({doc_name})",
+                "severity": "warning", "passed": match,
+                "message": f"L/C: '{lc_port}' vs {doc_name}: '{doc_port}'",
+                "field_keys": ["port_loading"]})
+
+    # LC NUMBER consistency
+    lc_nums = set()
+    for doc_name, doc_data in documents.items():
+        n = (doc_data.get("lc_number") or "").strip()
+        if n: lc_nums.add((doc_name, n))
+    if len(lc_nums) > 1:
+        unique = set(n for _, n in lc_nums)
+        checks.append({"rule_id": "NUM_001", "rule_name": "L/C number consistency",
+            "severity": "error", "passed": len(unique) == 1,
+            "message": f"Found: {', '.join(f'{nm}={n}' for nm, n in lc_nums)}",
+            "field_keys": ["lc_number"]})
+
+    passed = sum(1 for c in checks if c["passed"])
+    warnings = sum(1 for c in checks if c["severity"] == "warning" and not c["passed"])
+    errors = sum(1 for c in checks if c["severity"] == "error" and not c["passed"])
+    elapsed = int((time.perf_counter() - start) * 1000)
+
+    return {"success": True, "checks": checks, "total_checks": len(checks),
+            "passed_checks": passed, "warnings": warnings, "errors": errors,
+            "processing_time_ms": elapsed}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  VERIFICATION TOOLS (External APIs)
+# ═══════════════════════════════════════════════════════════════
+
+def _get_external_agent():
+    """Lazy-load the ExternalAPIAgent (it has all the API logic)."""
+    if not hasattr(_get_external_agent, "_instance"):
+        import sys, os
+        # Also check v1 path for the agent
+        v1_root = os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "lc_platform")
+        if os.path.exists(v1_root) and v1_root not in sys.path:
+            sys.path.insert(0, v1_root)
+
+        from agents.external_api_agent import ExternalAPIAgent
+        _get_external_agent._instance = ExternalAPIAgent()
+    return _get_external_agent._instance
+
+
+def _make_verification_request(vtype: str, value: str, context: dict = None, language: str = "en"):
+    """Build a verification request compatible with the ExternalAPIAgent."""
+    # Import from the agents' own models (v1 compat)
+    try:
+        from schemas.models import ExternalVerificationRequest
+    except ImportError:
+        # Fallback: build a simple namespace object
+        class _Req:
+            def __init__(self, **kw):
+                for k, v in kw.items(): setattr(self, k, v)
+        return _Req(verification_type=vtype, field_value=value,
+                     additional_context=context or {}, language=language)
+    return ExternalVerificationRequest(
+        verification_type=vtype, field_value=value,
+        additional_context=context or {}, language=language)
+
+
+@mcp.tool(tags={"verification", "swift"})
+def verify_swift_code(code: str, language: str = "en") -> dict:
+    """Verify a SWIFT/BIC code. Handles 8/10/11-char codes with smart cleanup."""
+    agent = _get_external_agent()
+    req = _make_verification_request("swift_code", code, language=language)
+    return agent.verify_swift_code(req).model_dump()
+
+
+@mcp.tool(tags={"verification", "port"})
+def verify_port(port_name: str, country: str = "", country_code: str = "", language: str = "en") -> dict:
+    """Verify a port via UNLOCODE (116K records) + Geoapify + Perplexity. Country-aware."""
+    agent = _get_external_agent()
+    req = _make_verification_request("port_verification", port_name,
+        context={"country": country, "country_code": country_code}, language=language)
+    return agent.verify_port(req).model_dump()
+
+
+@mcp.tool(tags={"verification", "hs_code"})
+def verify_hs_code(code: str, language: str = "en") -> dict:
+    """Verify an HS (Harmonized System) code against trade databases."""
+    agent = _get_external_agent()
+    req = _make_verification_request("hs_code", code, language=language)
+    return agent.verify_hs_code(req).model_dump()
+
+
+@mcp.tool(tags={"verification", "sanctions"})
+def check_sanctions(party_name: str, language: str = "en") -> dict:
+    """Screen a party name against OFAC, EU, and UN sanctions lists."""
+    agent = _get_external_agent()
+    req = _make_verification_request("sanctions", party_name, language=language)
+    return agent.check_sanctions(req).model_dump()
+
+
+@mcp.tool(tags={"verification", "company"})
+def verify_company(company_name: str, country: str = "", language: str = "en") -> dict:
+    """Verify company legitimacy via Exa + Perplexity. Cross-referenced, no false fraud flags."""
+    agent = _get_external_agent()
+    req = _make_verification_request("company_verification", company_name,
+        context={"country": country}, language=language)
+    return agent.verify_company(req).model_dump()
+
+
+@mcp.tool(tags={"verification", "bank"})
+def verify_bank_by_name(bank_name: str, country_code: str = "", language: str = "en") -> dict:
+    """Search for a bank by name via Exa + API Ninjas."""
+    agent = _get_external_agent()
+    req = _make_verification_request("bank_lookup", bank_name,
+        context={"country_code": country_code}, language=language)
+    return agent.verify_bank_by_name(req).model_dump()
+
+
+@mcp.tool(tags={"verification", "shipment"})
+def track_shipment(tracking_number: str, language: str = "en") -> dict:
+    """Track a container or Bill of Lading. Returns tracking URLs for 6 shipping lines."""
+    agent = _get_external_agent()
+    req = _make_verification_request("shipment_tracking", tracking_number, language=language)
+    return agent.track_shipment(req).model_dump()
+
+
+@mcp.tool(tags={"verification", "research"})
+def deep_research(query: str, context: str = "", language: str = "en") -> dict:
+    """Deep research on any entity/claim via Perplexity sonar-pro + Exa."""
+    agent = _get_external_agent()
+    req = _make_verification_request("deep_research", query,
+        context={"context": context}, language=language)
+    return agent.deep_research_verify(req).model_dump()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CHAT TOOL
+# ═══════════════════════════════════════════════════════════════
+
+@mcp.tool(tags={"chat"})
+def chat_with_document(
+    message: str,
+    extracted_data: dict = None,
+    pdf_text: str = "",
+    history: list = None,
+    language: str = "en",
+) -> dict:
+    """Chat about an L/C document with full context."""
+    from utils.llm_clients import call_llm
+
+    context = json.dumps(extracted_data or {}, indent=2, ensure_ascii=False, default=str)
+    pdf_excerpt = (pdf_text or "")[:8000]
+
+    history_str = ""
+    for msg in (history or [])[-10:]:
+        if isinstance(msg, dict):
+            history_str += f"{msg.get('role','user')}: {msg.get('content','')}\n"
+
+    lang_map = {"en": "Respond in English.", "ar": "أجب بالعربية.",
+                "es": "Responde en español.", "it": "Rispondi in italiano."}
+
+    prompt = f"""You are a helpful trade-finance document review assistant.
+{lang_map.get(language, "Respond in English.")}
+
+Extracted L/C data:
+{context}
+
+Raw PDF text (excerpt):
+{pdf_excerpt}
+
+History:
+{history_str}
+
+User: {message}
+
+Answer concisely based on the document data."""
+
+    try:
+        response_text = call_llm(prompt)
+        return {"message": response_text or "Sorry, I couldn't generate a response.", "language": language}
+    except Exception as e:
+        return {"message": f"Error: {str(e)}", "language": language}
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SYNC HELPERS (for non-async callers: FastAPI, Streamlit)
+# ═══════════════════════════════════════════════════════════════
+
+def call_tool(tool_name: str, args: dict) -> Any:
+    """Call any registered tool synchronously. Returns the tool's result data."""
+    async def _call():
+        result = await mcp._tool_manager.call_tool(tool_name, args)
+        return result.data if hasattr(result, "data") else result
+
+    try:
+        asyncio.get_running_loop()
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            return pool.submit(asyncio.run, _call()).result()
+    except RuntimeError:
+        return asyncio.run(_call())
+
+
+def list_tools() -> list[dict]:
+    """List all tools synchronously."""
+    async def _list():
+        tools = await mcp._tool_manager.get_tools()
+        return [{"name": n, "description": t.description, "tags": list(t.tags)} for n, t in tools.items()]
+    try:
+        asyncio.get_running_loop()
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            return pool.submit(asyncio.run, _list()).result()
+    except RuntimeError:
+        return asyncio.run(_list())
+
+
+# ═══════════════════════════════════════════════════════════════
+#  STANDALONE SERVER
+# ═══════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from dotenv import load_dotenv; load_dotenv()
+    from config.settings import get_settings
+    s = get_settings()
+    print(f"MagnaAI FastMCP Server — {len(list_tools())} tools")
+    for t in list_tools(): print(f"  {t['name']}: {t['description'][:60]}")
+    mcp.run(transport="sse", host="0.0.0.0", port=s.mcp_port)
